@@ -1,0 +1,21 @@
+# EventHub booking-management coverage
+
+| ID | Coverage |
+|---|---|
+| BKG-01 | Single-ticket booking, confirmation, reference format, saved booking details |
+| BKG-02 | Multiple-ticket quantity and calculated total |
+| BKG-03 | Quantity lower and upper boundaries |
+| BKG-04 | Invalid customer name, email, and phone |
+| BKG-05 | Sold-out event |
+| BKG-06 | Over-capacity rejection and exact remaining capacity |
+| BKG-07 | Booking details in My Bookings |
+| BKG-08 | Booking visibility isolation between accounts |
+| BKG-09 | Dismissing a cancellation |
+| BKG-10 | Confirming cancellation |
+| BKG-11 | Repeated cancellation safety |
+| BKG-12 | Authentication required for My Bookings |
+| BKG-13 | Zero-price event |
+| BKG-14 | Event inventory consumed before confirmation |
+| BKG-15 | Configured per-user booking limit |
+
+Cancellation behavior is asserted only where documented by the API (`cancelled` status); the suite does not assert seat restoration. BKG-15 requires the actual sandbox limit and a fresh account.
