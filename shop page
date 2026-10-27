@@ -1,0 +1,9 @@
+import type { Page } from '@playwright/test';
+
+export class ShopPage {
+  constructor(private readonly page: Page) {}
+
+  productHeading(productName: string) {
+    return this.page.getByRole('heading', { name: productName, exact: true });
+  }
+}
