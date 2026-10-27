@@ -1,0 +1,397 @@
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+
+const email = process.env.EVENTHUB_EMAIL;
+const password = process.env.EVENTHUB_PASSWORD;
+const secondEmail = process.env.EVENTHUB_SECOND_EMAIL;
+const secondPassword = process.env.EVENTHUB_SECOND_PASSWORD;
+const limitEmail = process.env.EVENTHUB_LIMIT_EMAIL;
+const limitPassword = process.env.EVENTHUB_LIMIT_PASSWORD;
+const apiUrl = process.env.EVENTHUB_API_URL?.replace(/\/+$/, '');
+const mutationsEnabled = process.env.EVENTHUB_ALLOW_MUTATIONS === '1';
+
+type EventRecord = {
+  id: number;
+  title: string;
+  price: number;
+  totalSeats: number;
+  availableSeats: number;
+};
+
+type BookingRecord = {
+  id: number;
+  eventId: number;
+  customerName: string;
+  customerEmail: string;
+  customerPhone: string;
+  quantity: number;
+  totalPrice: number;
+  status: 'confirmed' | 'cancelled';
+  bookingRef: string;
+};
+
+async function createEvent(
+  request: APIRequestContext,
+  eventIds: number[],
+  options: { seats?: number; price?: number } = {},
+): Promise<EventRecord> {
+  const title = `Playwright ${Date.now()} ${Math.random().toString(36).slice(2, 8)}`;
+  const response = await request.post(`${apiUrl}/events`, {
+    data: {
+      title,
+      description: 'Automated booking-management test event',
+      category: 'Workshop',
+      venue: 'Playwright Test Venue',
+      city: 'Bangalore',
+      eventDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      price: options.price ?? 125,
+      totalSeats: options.seats ?? 10,
+    },
+  });
+  expect(response.status(), 'test event creation should succeed').toBe(201);
+  const result = await response.json() as { data: EventRecord };
+  eventIds.push(result.data.id);
+  return result.data;
+}
+
+async function signIn(page: Page, userEmail: string, userPassword: string): Promise<void> {
+  await page.goto('/login');
+  await page.locator('#email').fill(userEmail);
+  await page.locator('#password').fill(userPassword);
+  await page.locator('#login-btn').click();
+  await expect(page.getByRole('button', { name: /logout/i })).toBeVisible();
+}
+
+async function openBookingForm(page: Page, event: EventRecord): Promise<void> {
+  await page.goto('/');
+  const card = page.locator('article').filter({ hasText: event.title });
+  await expect(card).toHaveCount(1);
+  await card.getByRole('link', { name: /book now/i }).click();
+  await expect(page.getByRole('button', { name: /confirm booking/i })).toBeVisible();
+}
+
+async function fillBookingForm(
+  page: Page,
+  userEmail: string,
+  quantity: number,
+  name = 'Playwright Customer',
+  phone = '+1 555 123 4567',
+): Promise<void> {
+  await page.locator('#customerName').fill(name);
+  await page.locator('#customer-email').fill(userEmail);
+  await page.locator('#phone').fill(phone);
+  await page.locator('input[type="number"]').fill(String(quantity));
+}
+
+async function confirmBooking(page: Page): Promise<string> {
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: /confirm booking/i }).click();
+  await expect(page.getByText(/booking confirmed/i)).toBeVisible();
+
+  const bodyText = await page.locator('body').innerText();
+  const reference = bodyText.match(/\b[A-Z]-[A-Z0-9]{6}\b/)?.[0];
+  expect(reference, 'confirmation should display a booking reference').toBeTruthy();
+  return reference!;
+}
+
+async function findBooking(request: APIRequestContext, reference: string): Promise<BookingRecord> {
+  const response = await request.get(`${apiUrl}/bookings/ref/${encodeURIComponent(reference)}`);
+  expect(response.ok(), 'booking reference should be retrievable').toBeTruthy();
+  const result = await response.json() as { data: BookingRecord };
+  return result.data;
+}
+
+async function bookingsForEvent(request: APIRequestContext, eventId: number): Promise<BookingRecord[]> {
+  const response = await request.get(`${apiUrl}/bookings?eventId=${eventId}&limit=100`);
+  expect(response.ok(), 'event bookings should be retrievable for assertions').toBeTruthy();
+  const result = await response.json() as { data: BookingRecord[] };
+  return result.data;
+}
+
+async function expectNoNewBooking(
+  request: APIRequestContext,
+  eventId: number,
+  initialCount: number,
+): Promise<void> {
+  expect(await bookingsForEvent(request, eventId)).toHaveLength(initialCount);
+}
+
+async function cancelBooking(page: Page, reference: string, confirm: boolean): Promise<void> {
+  await page.getByTestId('nav-bookings').click();
+  await expect(page).toHaveURL(/\/bookings\/?$/);
+  const row = page.locator('article, tr, [data-testid*="booking"]')
+    .filter({ hasText: reference })
+    .first();
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: /cancel booking/i }).click();
+
+  if (confirm) {
+    await page.getByRole('button', { name: /yes, cancel it/i }).click();
+  } else {
+    await page.getByRole('button', { name: /no|keep booking|go back/i }).click();
+  }
+  await expect(page.getByText(/cancel this booking\?/i)).toHaveCount(0);
+}
+
+test('BKG-12: signed-out users cannot access My Bookings', async ({ page }) => {
+  await page.goto('/bookings');
+  await expect(page).toHaveURL(/\/login\/?$/);
+  await expect(page.getByRole('button', { name: /cancel booking/i })).toHaveCount(0);
+});
+
+test.describe('booking management in an isolated sandbox', () => {
+  let eventIds: number[];
+
+  test.beforeEach(async () => {
+    test.skip(!email || !password, 'Set EVENTHUB_EMAIL and EVENTHUB_PASSWORD for the dedicated test account.');
+    test.skip(!apiUrl || !mutationsEnabled,
+      'Set EVENTHUB_API_URL and EVENTHUB_ALLOW_MUTATIONS=1 only for an isolated, disposable sandbox.');
+    eventIds = [];
+  });
+
+  test.afterEach(async ({ request }) => {
+    if (!apiUrl || !mutationsEnabled || !eventIds?.length) return;
+
+    for (const eventId of eventIds) {
+      const bookings = await bookingsForEvent(request, eventId);
+      for (const booking of bookings) {
+        if (booking.status !== 'confirmed') continue;
+        const deletion = await request.delete(`${apiUrl}/bookings/${booking.id}`);
+        expect([200, 404]).toContain(deletion.status());
+      }
+
+      const deletion = await request.delete(`${apiUrl}/events/${eventId}`);
+      expect([200, 404]).toContain(deletion.status());
+    }
+  });
+
+  test('BKG-01 and BKG-07: books one ticket and verifies its confirmation and details', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+    const reference = await confirmBooking(page);
+
+    expect(reference).toMatch(/^[A-Z]-[A-Z0-9]{6}$/);
+    const booking = await findBooking(request, reference);
+    expect(booking).toMatchObject({
+      eventId: event.id,
+      customerName: 'Playwright Customer',
+      customerEmail: email,
+      customerPhone: '+1 555 123 4567',
+      quantity: 1,
+      totalPrice: event.price,
+      status: 'confirmed',
+    });
+
+    await page.getByTestId('nav-bookings').click();
+    await expect(page).toHaveURL(/\/bookings\/?$/);
+    await expect(page.getByText(reference, { exact: true })).toBeVisible();
+    await expect(page.getByText(event.title, { exact: true })).toBeVisible();
+  });
+
+  test('BKG-02: calculates the total for multiple tickets', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 3);
+    const reference = await confirmBooking(page);
+
+    const booking = await findBooking(request, reference);
+    expect(booking.quantity).toBe(3);
+    expect(booking.totalPrice).toBe(event.price * 3);
+  });
+
+  test('BKG-03: rejects quantities outside 1–10', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    const quantity = page.locator('input[type="number"]');
+    const initialBookings = (await bookingsForEvent(request, event.id)).length;
+
+    for (const invalidQuantity of [0, 11, 1.5]) {
+      await fillBookingForm(page, email!, invalidQuantity);
+      expect(await quantity.evaluate((input: HTMLInputElement) => input.checkValidity())).toBe(false);
+      await page.getByRole('button', { name: /confirm booking/i }).click();
+      await expect(page.getByText(/booking confirmed/i)).toHaveCount(0);
+      await expectNoNewBooking(request, event.id, initialBookings);
+    }
+  });
+
+  test('BKG-04: rejects invalid customer name, email, and phone', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    const initialBookings = (await bookingsForEvent(request, event.id)).length;
+
+    const invalidCases = [
+      { name: 'A', email, phone: '+1 555 123 4567' },
+      { name: 'Playwright Customer', email: 'not-an-email', phone: '+1 555 123 4567' },
+      { name: 'Playwright Customer', email, phone: '12345' },
+    ];
+
+    for (const invalid of invalidCases) {
+      await fillBookingForm(page, invalid.email!, 1, invalid.name, invalid.phone);
+      await page.getByRole('button', { name: /confirm booking/i }).click();
+      await expect(page.getByText(/booking confirmed/i)).toHaveCount(0);
+      await expectNoNewBooking(request, event.id, initialBookings);
+    }
+  });
+
+  test('BKG-05: does not allow booking a sold-out event', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds, { seats: 1 });
+    const soldOutBooking = await request.post(`${apiUrl}/bookings`, {
+      data: {
+        eventId: event.id,
+        customerName: 'Inventory Setup',
+        customerEmail: email,
+        customerPhone: '+1 555 123 4567',
+        quantity: 1,
+      },
+    });
+    expect(soldOutBooking.status()).toBe(201);
+    const soldOutEvent = await request.get(`${apiUrl}/events/${event.id}`);
+    expect(soldOutEvent.ok()).toBe(true);
+    const soldOutResult = await soldOutEvent.json() as { data: EventRecord };
+    expect(soldOutResult.data.availableSeats).toBe(0);
+
+    await signIn(page, email!, password!);
+    await page.goto('/');
+    const card = page.locator('article').filter({ hasText: event.title });
+    await expect(card).toBeVisible();
+    const initialBookings = (await bookingsForEvent(request, event.id)).length;
+    const bookLink = card.getByRole('link', { name: /book now/i });
+    if (await bookLink.count()) {
+      await bookLink.click();
+      await expect(page.getByRole('button', { name: /confirm booking/i })).toHaveCount(0);
+    } else {
+      await expect(card).toContainText(/sold out|unavailable|no seats/i);
+    }
+    await expectNoNewBooking(request, event.id, initialBookings);
+  });
+
+  test('BKG-06: enforces the available-seat limit and accepts the exact remaining capacity', async ({ page, request }) => {
+    const overCapacityEvent = await createEvent(request, eventIds, { seats: 2 });
+    await signIn(page, email!, password!);
+    await openBookingForm(page, overCapacityEvent);
+    const before = (await bookingsForEvent(request, overCapacityEvent.id)).length;
+    await fillBookingForm(page, email!, 3);
+    await page.getByRole('button', { name: /confirm booking/i }).click();
+    await expect(page.getByText(/booking confirmed/i)).toHaveCount(0);
+    await expectNoNewBooking(request, overCapacityEvent.id, before);
+
+    const exactCapacityEvent = await createEvent(request, eventIds, { seats: 2 });
+    await openBookingForm(page, exactCapacityEvent);
+    await fillBookingForm(page, email!, 2);
+    const reference = await confirmBooking(page);
+    expect((await findBooking(request, reference)).quantity).toBe(2);
+    const remaining = await request.get(`${apiUrl}/events/${exactCapacityEvent.id}`);
+    expect(remaining.ok()).toBe(true);
+    const result = await remaining.json() as { data: EventRecord };
+    expect(result.data.availableSeats).toBe(0);
+  });
+
+  test('BKG-08: keeps one user’s bookings out of another user’s list', async ({ page, request }) => {
+    test.skip(!secondEmail || !secondPassword,
+      'Set EVENTHUB_SECOND_EMAIL and EVENTHUB_SECOND_PASSWORD for the second dedicated test account.');
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+    const reference = await confirmBooking(page);
+    await page.getByRole('button', { name: /logout/i }).click();
+
+    await signIn(page, secondEmail!, secondPassword!);
+    await page.getByTestId('nav-bookings').click();
+    await expect(page).toHaveURL(/\/bookings\/?$/);
+    await expect(page.getByText(reference, { exact: true })).toHaveCount(0);
+    await expect(page.getByText(event.title, { exact: true })).toHaveCount(0);
+  });
+
+  test('BKG-09: dismissing cancellation leaves a booking active', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+    const reference = await confirmBooking(page);
+    await cancelBooking(page, reference, false);
+
+    await expect(page.getByText(reference, { exact: true })).toBeVisible();
+    expect((await findBooking(request, reference)).status).toBe('confirmed');
+  });
+
+  test('BKG-10 and BKG-11: confirms cancellation and safely handles a repeat attempt', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds);
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+    const reference = await confirmBooking(page);
+    await cancelBooking(page, reference, true);
+
+    await expect(page.getByText(/cancelled|canceled|booking removed/i)).toBeVisible();
+    const booking = await findBooking(request, reference);
+    expect(booking.status).toBe('cancelled');
+
+    await page.reload();
+    const row = page.locator('article, tr, [data-testid*="booking"]')
+      .filter({ hasText: reference })
+      .first();
+    const cancelButton = row.getByRole('button', { name: /cancel booking/i });
+    if (await cancelButton.count()) {
+      await cancelButton.click();
+      await expect(page.getByRole('button', { name: /yes, cancel it/i })).toHaveCount(0);
+    }
+  });
+
+  test('BKG-13: books a zero-priced event', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds, { price: 0 });
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+    const reference = await confirmBooking(page);
+    expect((await findBooking(request, reference)).totalPrice).toBe(0);
+  });
+
+  test('BKG-14: rejects confirmation after another booking consumes the last seat', async ({ page, request }) => {
+    const event = await createEvent(request, eventIds, { seats: 1 });
+    await signIn(page, email!, password!);
+    await openBookingForm(page, event);
+    await fillBookingForm(page, email!, 1);
+
+    const competingBooking = await request.post(`${apiUrl}/bookings`, {
+      data: {
+        eventId: event.id,
+        customerName: 'Inventory Setup',
+        customerEmail: email,
+        customerPhone: '+1 555 123 4567',
+        quantity: 1,
+      },
+    });
+    expect(competingBooking.status()).toBe(201);
+
+    await page.getByRole('button', { name: /confirm booking/i }).click();
+    await expect(page.getByText(/booking confirmed/i)).toHaveCount(0);
+    await expect(page.getByText(/sold out|unavailable|not enough seats|no seats/i)).toBeVisible();
+    expect((await bookingsForEvent(request, event.id)).filter(item => item.status === 'confirmed'))
+      .toHaveLength(1);
+  });
+
+  test('BKG-15: enforces the configured per-user booking limit when provided', async ({ page, request }) => {
+    const limit = Number(process.env.EVENTHUB_BOOKING_LIMIT);
+    test.skip(!Number.isInteger(limit) || limit < 1 || !limitEmail || !limitPassword,
+      'Set EVENTHUB_BOOKING_LIMIT and the fresh-account EVENTHUB_LIMIT_EMAIL/PASSWORD variables.');
+
+    await signIn(page, limitEmail!, limitPassword!);
+    for (let count = 0; count < limit; count += 1) {
+      const event = await createEvent(request, eventIds);
+      await openBookingForm(page, event);
+      await fillBookingForm(page, limitEmail!, 1);
+      await confirmBooking(page);
+    }
+
+    const additionalEvent = await createEvent(request, eventIds);
+    await openBookingForm(page, additionalEvent);
+    await fillBookingForm(page, limitEmail!, 1);
+    await page.getByRole('button', { name: /confirm booking/i }).click();
+    await expect(page.getByText(/booking confirmed/i)).toHaveCount(0);
+  });
+});
